@@ -1,25 +1,57 @@
-Before touching the new environment, Azure CLI is ideal because it gives us the exact resource IDs, VNet integration, DNS configuration, private endpoints, DNS zone groups, identity and RBAC configuration.
+Existing Azure Web App → Key Vault → Azure SQL Connectivity Audit
 
-Use Azure Cloud Shell – Bash for the commands below. All of these are read-only.
+Purpose
 
-1. Set the existing environment variables
+Before configuring a new environment, first reverse-engineer the existing working environment.
 
-WEBAPP_RG="<CURRENT-WEBAPP-RG>"
-WEBAPP_NAME="<CURRENT-WEBAPP-NAME>"
-KV_RG="<CURRENT-KEYVAULT-RG>"
-KV_NAME="<CURRENT-KEYVAULT-NAME>"
-SQL_RG="<CURRENT-SQL-RG>"
-SQL_SERVER="<CURRENT-SQL-SERVER-NAME>"
+The goal is to understand exactly how the current Azure Web App connects privately to:
 
-First confirm you’re in the right subscription:
+* Azure Key Vault
+* Azure SQL Database
+
+The audit should identify:
+
+* App Service VNet Integration
+* Integration subnet
+* VNet DNS configuration
+* Private DNS zones
+* Private Endpoint configuration
+* Private DNS Zone Groups
+* Managed Identity
+* Key Vault RBAC
+* SQL connectivity configuration
+* Route tables and NSGs, if applicable
+
+All commands below are read-only.
+
+⸻
+
+1. Define Environment Variables
+
+Run from Azure Cloud Shell using Bash.
+
+WEBAPP_RG="<CURRENT_WEBAPP_RESOURCE_GROUP>"
+WEBAPP_NAME="<CURRENT_WEBAPP_NAME>"
+KV_RG="<CURRENT_KEYVAULT_RESOURCE_GROUP>"
+KV_NAME="<CURRENT_KEYVAULT_NAME>"
+SQL_RG="<CURRENT_SQL_RESOURCE_GROUP>"
+SQL_SERVER="<CURRENT_SQL_SERVER_NAME>"
+
+Do not store real subscription IDs, principal IDs, passwords, or secret values in documentation.
+
+⸻
+
+2. Confirm Azure Subscription
 
 az account show \
   --query "{Subscription:name,SubscriptionId:id,TenantId:tenantId}" \
   -o table
 
+Confirm that the CLI is connected to the subscription containing the current working environment.
+
 ⸻
 
-2. Inspect the current Web App
+3. Check Web App Basic Configuration
 
 az webapp show \
   --resource-group $WEBAPP_RG \
@@ -27,57 +59,94 @@ az webapp show \
   --query "{Name:name,Location:location,DefaultHostName:defaultHostName,PublicNetworkAccess:publicNetworkAccess,HttpsOnly:httpsOnly}" \
   -o json
 
-Most importantly, check its VNet Integration:
+Record:
+
+Web App Name:
+Location:
+Public Network Access:
+Default Host Name:
+
+⸻
+
+4. Check Web App VNet Integration
+
+This is one of the most important checks.
 
 az webapp vnet-integration list \
   --resource-group $WEBAPP_RG \
   --name $WEBAPP_NAME \
   -o json
 
-This is one of the most important outputs. It tells us exactly which VNet/subnet the working Web App is using. az webapp vnet-integration list is the supported CLI command for inspecting App Service VNet integration. 
+Identify:
 
-Also inspect the underlying App Service network properties:
+VNet:
+Integration Subnet:
+Subnet Resource ID:
+
+Expected architecture:
+
+Azure Web App
+      │
+      │ VNet Integration
+      ▼
+App Service Integration Subnet
+      │
+      ├── Key Vault Private Endpoint
+      │
+      └── SQL Private Endpoint
+
+The Web App uses VNet Integration for outbound private connectivity.
+
+A Web App Private Endpoint, if present, is primarily for private inbound connectivity to the Web App.
+
+⸻
+
+5. Inspect App Service Network Properties
+
+Get the Web App resource ID:
 
 WEBAPP_ID=$(az webapp show \
-  -g $WEBAPP_RG \
-  -n $WEBAPP_NAME \
-  --query id -o tsv)
+  --resource-group $WEBAPP_RG \
+  --name $WEBAPP_NAME \
+  --query id \
+  -o tsv)
+
+Then inspect network-related properties:
+
 az resource show \
   --ids "$WEBAPP_ID" \
   --query "properties.{VNetSubnet:virtualNetworkSubnetId,VNetRouteAll:vnetRouteAllEnabled,DNS:dnsConfiguration}" \
   -o json
 
-This is useful because earlier Azure architectures sometimes use vnetRouteAllEnabled, while newer configurations can also expose routing/DNS through site properties.
+Record:
+
+VNet Subnet:
+Route All Enabled:
+DNS Configuration:
 
 ⸻
 
-3. Check whether any special DNS settings were added
+6. Check App Service DNS Overrides
 
-This is especially important given the DNS troubleshooting we did previously.
-
-Run:
+Check only relevant networking settings.
 
 az webapp config appsettings list \
-  -g $WEBAPP_RG \
-  -n $WEBAPP_NAME \
+  --resource-group $WEBAPP_RG \
+  --name $WEBAPP_NAME \
   --query "[?name=='WEBSITE_DNS_SERVER' || name=='WEBSITE_DNS_ALT_SERVER' || name=='WEBSITE_VNET_ROUTE_ALL'].{Setting:name,Value:value}" \
   -o table
 
-This only retrieves the relevant network/DNS settings; it does not dump all application secrets.
+Possible settings include:
 
-Possible result:
+WEBSITE_DNS_SERVER
+WEBSITE_DNS_ALT_SERVER
+WEBSITE_VNET_ROUTE_ALL
 
-Setting                    Value
--------------------------  -------------
-WEBSITE_DNS_SERVER         <DNS-IP>
-WEBSITE_DNS_ALT_SERVER     <DNS-IP>
-WEBSITE_VNET_ROUTE_ALL     1
-
-Or it may return nothing, which is also meaningful.
+If no values are returned, the Web App may be relying on the VNet’s normal DNS configuration.
 
 ⸻
 
-4. Inspect the Web App Managed Identity
+7. Check Web App Managed Identity
 
 az webapp identity show \
   --resource-group $WEBAPP_RG \
@@ -87,23 +156,23 @@ az webapp identity show \
 
 Expected:
 
-{
-  "Type": "SystemAssigned",
-  "PrincipalId": "<MASKED>",
-  "TenantId": "<MASKED>"
-}
+Type: SystemAssigned
+PrincipalId: <MASKED>
+TenantId: <MASKED>
 
-Save the Principal ID for RBAC inspection:
+Store the Principal ID temporarily:
 
 PRINCIPAL_ID=$(az webapp identity show \
-  -g $WEBAPP_RG \
-  -n $WEBAPP_NAME \
+  --resource-group $WEBAPP_RG \
+  --name $WEBAPP_NAME \
   --query principalId \
   -o tsv)
 
+Do not expose the Principal ID unnecessarily in documentation.
+
 ⸻
 
-5. Inspect the existing Key Vault configuration
+8. Check Key Vault Configuration
 
 az keyvault show \
   --name $KV_NAME \
@@ -111,26 +180,31 @@ az keyvault show \
   --query "{Name:name,Location:location,RBAC:properties.enableRbacAuthorization,PublicNetworkAccess:properties.publicNetworkAccess,DefaultNetworkAction:properties.networkAcls.defaultAction}" \
   -o json
 
-This answers several important questions immediately:
+Record:
 
-Does it use Azure RBAC?
-Is public access enabled or disabled?
-Is networking default Allow or Deny?
+RBAC Enabled:
+Public Network Access:
+Default Network Action:
 
-Then get the resource ID:
+For Azure RBAC-based Key Vault access, expect:
 
-KV_ID=$(az keyvault show \
-  -n $KV_NAME \
-  -g $KV_RG \
-  --query id \
-  -o tsv)
-echo $KV_ID
+RBAC: true
 
 ⸻
 
-6. Verify Web App → Key Vault RBAC
+9. Get Key Vault Resource ID
 
-Now check specifically what the Web App Managed Identity has on the Key Vault:
+KV_ID=$(az keyvault show \
+  --name $KV_NAME \
+  --resource-group $KV_RG \
+  --query id \
+  -o tsv)
+
+⸻
+
+10. Check Web App → Key Vault RBAC
+
+Check only the Web App Managed Identity’s permissions against the Key Vault.
 
 az role assignment list \
   --assignee $PRINCIPAL_ID \
@@ -139,19 +213,29 @@ az role assignment list \
   --query "[].{Role:roleDefinitionName,Scope:scope}" \
   -o table
 
-This should reveal something like:
+For an application that only reads secrets, expect:
 
-Role                      Scope
-------------------------  --------------------------------
-Key Vault Secrets User    /subscriptions/.../vaults/<KV>
+Key Vault Secrets User
 
-This tells us exactly what role the working environment uses.
+Architecture:
+
+Web App
+   │
+   └── System-Assigned Managed Identity
+                │
+                ▼
+       Key Vault Secrets User
+                │
+                ▼
+            Key Vault
+
+This role controls authorization.
+
+It is independent of DNS and private network connectivity.
 
 ⸻
 
-7. Inspect Azure SQL configuration
-
-Get the SQL Server configuration:
+11. Check Azure SQL Server Configuration
 
 az sql server show \
   --resource-group $SQL_RG \
@@ -159,270 +243,281 @@ az sql server show \
   --query "{Name:name,FQDN:fullyQualifiedDomainName,Location:location,PublicNetworkAccess:publicNetworkAccess,MinimumTLS:minimalTlsVersion}" \
   -o json
 
-Save its resource ID:
+Record:
 
-SQL_ID=$(az sql server show \
-  -g $SQL_RG \
-  -n $SQL_SERVER \
-  --query id \
-  -o tsv)
-echo $SQL_ID
+SQL Server:
+FQDN:
+Public Network Access:
+TLS Version:
 
-The important FQDN should remain something like:
+The application should normally connect using:
 
-<sql-server>.database.windows.net
+<SQL_SERVER>.database.windows.net
 
-even though traffic ultimately goes to a private IP.
+and not the private endpoint IP directly.
 
 ⸻
 
-8. Discover all relevant Private Endpoints
+12. Discover Existing Private Endpoints
 
-This command is very useful:
+Run:
 
 az network private-endpoint list \
   --query "[].{PE:name,ResourceGroup:resourceGroup,Target:privateLinkServiceConnections[0].privateLinkServiceId,Group:privateLinkServiceConnections[0].groupIds[0],Status:privateLinkServiceConnections[0].privateLinkServiceConnectionState.status,Subnet:subnet.id}" \
   -o table
 
-Look for targets ending in:
+Identify private endpoints targeting:
 
-Microsoft.KeyVault/vaults/<KEYVAULT>
+Microsoft.KeyVault/vaults/<KEYVAULT_NAME>
 
 and:
 
-Microsoft.Sql/servers/<SQL-SERVER>
+Microsoft.Sql/servers/<SQL_SERVER_NAME>
 
-You should find something conceptually like:
+Record:
 
-Private Endpoint       Target                 Group       Status
----------------------  ---------------------  ----------  --------
-<kv-pe>                .../vaults/<KV>        vault       Approved
-<sql-pe>               .../servers/<SQL>      sqlServer   Approved
-
-This tells us:
-
-* exact PE names
-* PE resource groups
-* subnets
-* target resource
-* connection status
+Resource	Private Endpoint	PE Resource Group	Subnet	Status
+Key Vault	<KV_PE>	<PE_RG>	<SUBNET>	Approved
+Azure SQL	<SQL_PE>	<PE_RG>	<SUBNET>	Approved
 
 ⸻
 
-9. Inspect each Private Endpoint deeply
-
-After identifying the Key Vault PE:
+13. Inspect Key Vault Private Endpoint
 
 az network private-endpoint show \
-  --resource-group <KV-PE-RG> \
-  --name <KV-PE-NAME> \
+  --resource-group <KV_PRIVATE_ENDPOINT_RG> \
+  --name <KV_PRIVATE_ENDPOINT_NAME> \
   -o json
 
-For SQL:
+Verify:
 
-az network private-endpoint show \
-  --resource-group <SQL-PE-RG> \
-  --name <SQL-PE-NAME> \
-  -o json
-
-az network private-endpoint show is the supported command for retrieving PE configuration. 
+Target resource = Key Vault
+Group ID = vault
+Connection status = Approved
+Subnet = expected PE subnet
 
 ⸻
 
-10. This is a particularly important check: DNS Zone Group
+14. Inspect SQL Private Endpoint
 
-For Key Vault:
-
-az network private-endpoint dns-zone-group list \
-  --resource-group <KV-PE-RG> \
-  --endpoint-name <KV-PE-NAME> \
+az network private-endpoint show \
+  --resource-group <SQL_PRIVATE_ENDPOINT_RG> \
+  --name <SQL_PRIVATE_ENDPOINT_NAME> \
   -o json
 
-For SQL:
+Verify:
+
+Target resource = SQL Server
+Group ID = sqlServer
+Connection status = Approved
+Subnet = expected PE subnet
+
+⸻
+
+15. Check Private Endpoint DNS Zone Groups
+
+This is an important check.
+
+Key Vault
 
 az network private-endpoint dns-zone-group list \
-  --resource-group <SQL-PE-RG> \
-  --endpoint-name <SQL-PE-NAME> \
+  --resource-group <KV_PRIVATE_ENDPOINT_RG> \
+  --endpoint-name <KV_PRIVATE_ENDPOINT_NAME> \
   -o json
 
-We want to discover whether the existing working setup has:
+Expected Private DNS zone:
 
-Key Vault PE
-   ↓
 privatelink.vaultcore.azure.net
 
-and:
+Azure SQL
 
-SQL PE
-   ↓
+az network private-endpoint dns-zone-group list \
+  --resource-group <SQL_PRIVATE_ENDPOINT_RG> \
+  --endpoint-name <SQL_PRIVATE_ENDPOINT_NAME> \
+  -o json
+
+Expected Private DNS zone:
+
 privatelink.database.windows.net
 
-This is one of the checks I particularly want you to run.
+Expected relationships:
 
-Microsoft notes that if a private endpoint has no DNS zone group, Azure does not automatically maintain the corresponding Private DNS record; some other DNS mechanism must then exist. 
+Key Vault PE
+     │
+     └── privatelink.vaultcore.azure.net
+SQL PE
+     │
+     └── privatelink.database.windows.net
 
 ⸻
 
-11. Discover where the Private DNS zones actually exist
-
-Run:
+16. Locate Private DNS Zones
 
 az network private-dns zone list \
   --query "[?name=='privatelink.vaultcore.azure.net' || name=='privatelink.database.windows.net'].{Zone:name,ResourceGroup:resourceGroup}" \
   -o table
 
-Expected:
+Record:
 
-Zone                                    ResourceGroup
---------------------------------------  --------------------
-privatelink.database.windows.net        <DNS-RG>
-privatelink.vaultcore.azure.net         <DNS-RG>
+Private DNS Zone	Resource Group
+privatelink.vaultcore.azure.net	<DNS_RG>
+privatelink.database.windows.net	<DNS_RG>
 
-This is important because the DNS zones may be in a central networking resource group, not the application RG.
-
-⸻
-
-12. Check DNS A records
-
-For Key Vault:
-
-az network private-dns record-set a list \
-  --resource-group <DNS-RG> \
-  --zone-name privatelink.vaultcore.azure.net \
-  -o table
-
-For SQL:
-
-az network private-dns record-set a list \
-  --resource-group <DNS-RG> \
-  --zone-name privatelink.database.windows.net \
-  -o table
-
-We want to see records similar to:
-
-<KeyVaultName>     → 10.x.x.x
-<SQLServerName>    → 10.x.x.x
-
-Azure CLI provides commands for listing and inspecting Private DNS zones and their records. 
+These zones may exist in a centralized networking resource group rather than the application’s resource group.
 
 ⸻
 
-13. Check which VNet is linked to each Private DNS zone
+17. Check Key Vault Private DNS Record
 
-For Key Vault:
-
-az network private-dns link vnet list \
-  --resource-group <DNS-RG> \
+az network private-dns record-set a list \
+  --resource-group <DNS_RESOURCE_GROUP> \
   --zone-name privatelink.vaultcore.azure.net \
   -o table
 
-For SQL:
+Look for:
 
-az network private-dns link vnet list \
-  --resource-group <DNS-RG> \
+<KEYVAULT_NAME> → <PRIVATE_IP>
+
+Example:
+
+<KEYVAULT_NAME> → 10.x.x.x
+
+⸻
+
+18. Check SQL Private DNS Record
+
+az network private-dns record-set a list \
+  --resource-group <DNS_RESOURCE_GROUP> \
   --zone-name privatelink.database.windows.net \
   -o table
 
-This is critical.
+Look for:
 
-We want to determine whether:
+<SQL_SERVER_NAME> → <PRIVATE_IP>
+
+Example:
+
+<SQL_SERVER_NAME> → 10.x.x.x
+
+⸻
+
+19. Check Private DNS VNet Links
+
+Key Vault DNS Zone
+
+az network private-dns link vnet list \
+  --resource-group <DNS_RESOURCE_GROUP> \
+  --zone-name privatelink.vaultcore.azure.net \
+  -o table
+
+SQL DNS Zone
+
+az network private-dns link vnet list \
+  --resource-group <DNS_RESOURCE_GROUP> \
+  --zone-name privatelink.database.windows.net \
+  -o table
+
+Determine whether the Web App integration VNet is directly linked to the zones.
+
+Expected design may be:
 
 Web App Integration VNet
-        │
-        ├── linked → privatelink.database.windows.net
-        │
-        └── linked → privatelink.vaultcore.azure.net
+       │
+       ├── privatelink.vaultcore.azure.net
+       │
+       └── privatelink.database.windows.net
 
-Or whether the environment instead uses corporate/custom DNS forwarding.
+If the VNet is not linked directly, investigate whether corporate/custom DNS forwards these namespaces to Azure Private DNS or Azure Private Resolver.
 
 ⸻
 
-14. Inspect the VNet’s DNS servers
+20. Check VNet DNS Configuration
 
-From Step 2, identify:
-
-VNET_RG
-VNET_NAME
-
-Then:
+Using the VNet discovered from the Web App’s VNet Integration:
 
 az network vnet show \
-  --resource-group <VNET-RG> \
-  --name <VNET-NAME> \
+  --resource-group <VNET_RESOURCE_GROUP> \
+  --name <VNET_NAME> \
   --query "{Name:name,AddressSpace:addressSpace.addressPrefixes,DnsServers:dhcpOptions.dnsServers}" \
   -o json
 
-This output is extremely important.
-
-If you see:
+If the result is:
 
 "DnsServers": []
 
 the VNet is using Azure-provided DNS.
 
-If you see something like:
+If the result contains private IPs:
 
 "DnsServers": [
-    "10.x.x.x",
-    "10.x.x.x"
+  "10.x.x.x",
+  "10.x.x.x"
 ]
 
-then the environment is using custom/corporate DNS.
+the environment uses custom/corporate DNS.
 
-Microsoft specifically recommends checking dhcpOptions.dnsServers when diagnosing private DNS behavior. 
+In that situation, verify that those DNS servers can resolve or forward:
+
+privatelink.vaultcore.azure.net
+privatelink.database.windows.net
 
 ⸻
 
-15. Inspect the exact App Service integration subnet
+21. Inspect App Service Integration Subnet
 
 az network vnet subnet show \
-  --resource-group <VNET-RG> \
-  --vnet-name <VNET-NAME> \
-  --name <APP-INTEGRATION-SUBNET> \
+  --resource-group <VNET_RESOURCE_GROUP> \
+  --vnet-name <VNET_NAME> \
+  --name <APP_INTEGRATION_SUBNET> \
   --query "{Name:name,AddressPrefix:addressPrefix,Delegations:delegations[].serviceName,NSG:networkSecurityGroup.id,RouteTable:routeTable.id,PrivateEndpointPolicies:privateEndpointNetworkPolicies}" \
   -o json
 
-For App Service integration, you would normally expect:
+The App Service integration subnet should normally show:
 
-Delegation:
 Microsoft.Web/serverFarms
 
-Microsoft’s current App Service guidance continues to use the integration subnet and Microsoft.Web/serverFarms delegation for VNet integration. 
+under delegation.
+
+Record:
+
+Subnet:
+Address Prefix:
+Delegation:
+NSG:
+Route Table:
 
 ⸻
 
-16. Check whether a route table is involved
+22. Check Route Table
 
-If Step 15 returns a route table, inspect it:
+If the integration subnet has a route table:
 
 az network route-table show \
-  --resource-group <ROUTE-TABLE-RG> \
-  --name <ROUTE-TABLE-NAME> \
+  --resource-group <ROUTE_TABLE_RESOURCE_GROUP> \
+  --name <ROUTE_TABLE_NAME> \
   -o json
 
 Then:
 
 az network route-table route list \
-  --resource-group <ROUTE-TABLE-RG> \
-  --route-table-name <ROUTE-TABLE-NAME> \
+  --resource-group <ROUTE_TABLE_RESOURCE_GROUP> \
+  --route-table-name <ROUTE_TABLE_NAME> \
   -o table
 
-This tells us whether traffic is being sent through:
+Check whether traffic is routed through:
 
-Firewall
+Azure Firewall
 NVA
 VPN
 ExpressRoute
 Internet
-Virtual network
-
-and could explain why the current setup behaves differently from a simple Azure-native design.
+Virtual Network
 
 ⸻
 
-17. Determine how the application gets SQL/Key Vault configuration
+23. Check Application Connection Configuration Safely
 
-Do not dump connection-string values.
+Do not display connection string values.
 
 List only connection-string names and types:
 
@@ -432,65 +527,223 @@ az webapp config connection-string list \
   --query "[].{Name:name,Type:type}" \
   -o table
 
-Then list only App Setting names, not values:
+List potentially relevant application-setting names only:
 
 az webapp config appsettings list \
-  -g $WEBAPP_RG \
-  -n $WEBAPP_NAME \
+  --resource-group $WEBAPP_RG \
+  --name $WEBAPP_NAME \
   --query "[].name" \
   -o tsv | grep -Ei "sql|database|db|keyvault|vault|clientid|managed"
 
-This can tell us whether the working app is using something like:
+This helps determine whether the application is using settings such as:
 
 KeyVaultURL
 SQLConnectionString
 DatabaseConnection
 ClientID
 
-without exposing the actual secrets.
+without exposing secret values.
 
 ⸻
 
-What I want to reconstruct
+24. Runtime Validation From the Existing Web App
 
-Once these outputs are collected, we can make an exact diagram like:
+Configuration inspection should be followed by tests from the running Web App environment.
 
-CURRENT WORKING ENVIRONMENT
-Azure Web App
-    │
-    ├── System Managed Identity
-    │       │
-    │       └── Key Vault Secrets User
-    │
-    └── VNet Integration
-             │
-             ▼
-       <VNET>/<SUBNET>
-             │
-        DNS servers
-             │
-       ┌─────┴──────┐
-       │            │
-       ▼            ▼
-Private DNS      Private DNS
-KV zone          SQL zone
-       │            │
-       ▼            ▼
-KV Private PE    SQL Private PE
-10.x.x.x         10.x.x.x
-       │            │
-       ▼            ▼
-Key Vault       Azure SQL
+From Kudu/SSH/diagnostic console:
 
-The first commands I would run now
+Key Vault DNS
 
-Don’t run everything at once. Start with these six:
+Resolve-DnsName <KEYVAULT_NAME>.vault.azure.net
 
-az webapp vnet-integration list -g $WEBAPP_RG -n $WEBAPP_NAME -o json
-az webapp identity show -g $WEBAPP_RG -n $WEBAPP_NAME -o json
-az webapp config appsettings list -g $WEBAPP_RG -n $WEBAPP_NAME --query "[?name=='WEBSITE_DNS_SERVER' || name=='WEBSITE_DNS_ALT_SERVER' || name=='WEBSITE_VNET_ROUTE_ALL'].{Setting:name,Value:value}" -o table
-az keyvault show -g $KV_RG -n $KV_NAME --query "{RBAC:properties.enableRbacAuthorization,PublicNetworkAccess:properties.publicNetworkAccess,DefaultAction:properties.networkAcls.defaultAction}" -o json
-az network private-endpoint list --query "[].{PE:name,RG:resourceGroup,Target:privateLinkServiceConnections[0].privateLinkServiceId,Group:privateLinkServiceConnections[0].groupIds[0],Status:privateLinkServiceConnections[0].privateLinkServiceConnectionState.status,Subnet:subnet.id}" -o table
-az network private-dns zone list --query "[?name=='privatelink.vaultcore.azure.net' || name=='privatelink.database.windows.net'].{Zone:name,RG:resourceGroup}" -o table
+Expected:
 
-Send me those six outputs first—you can mask subscription IDs/principal IDs. From them, I can map your existing architecture and tell you exactly which next CLI commands to run, rather than guessing the VNet/PE/DNS resource groups. Runtime DNS (Resolve-DnsName) still needs to be tested from the Web App worker/Kudu after we understand the configuration.
+<KEYVAULT_NAME>.vault.azure.net
+        ↓
+<KEYVAULT_NAME>.privatelink.vaultcore.azure.net
+        ↓
+10.x.x.x
+
+SQL DNS
+
+Resolve-DnsName <SQL_SERVER_NAME>.database.windows.net
+
+Expected:
+
+<SQL_SERVER_NAME>.database.windows.net
+        ↓
+<SQL_SERVER_NAME>.privatelink.database.windows.net
+        ↓
+10.x.x.x
+
+⸻
+
+25. Runtime TCP Validation
+
+Key Vault
+
+Test-NetConnection <KEYVAULT_NAME>.vault.azure.net -Port 443
+
+Expected:
+
+TcpTestSucceeded : True
+
+Azure SQL
+
+Test-NetConnection <SQL_SERVER_NAME>.database.windows.net -Port 1433
+
+Expected:
+
+TcpTestSucceeded : True
+
+DNS and TCP tests do not require Key Vault RBAC.
+
+RBAC is only required when the application attempts to access Key Vault data such as a secret.
+
+⸻
+
+Recommended Initial Audit Commands
+
+Start with these commands before performing deeper analysis.
+
+1. Web App VNet Integration
+
+az webapp vnet-integration list \
+  -g $WEBAPP_RG \
+  -n $WEBAPP_NAME \
+  -o json
+
+2. Web App Managed Identity
+
+az webapp identity show \
+  -g $WEBAPP_RG \
+  -n $WEBAPP_NAME \
+  -o json
+
+3. App Service DNS Overrides
+
+az webapp config appsettings list \
+  -g $WEBAPP_RG \
+  -n $WEBAPP_NAME \
+  --query "[?name=='WEBSITE_DNS_SERVER' || name=='WEBSITE_DNS_ALT_SERVER' || name=='WEBSITE_VNET_ROUTE_ALL'].{Setting:name,Value:value}" \
+  -o table
+
+4. Key Vault Security Configuration
+
+az keyvault show \
+  -g $KV_RG \
+  -n $KV_NAME \
+  --query "{RBAC:properties.enableRbacAuthorization,PublicNetworkAccess:properties.publicNetworkAccess,DefaultAction:properties.networkAcls.defaultAction}" \
+  -o json
+
+5. Private Endpoints
+
+az network private-endpoint list \
+  --query "[].{PE:name,RG:resourceGroup,Target:privateLinkServiceConnections[0].privateLinkServiceId,Group:privateLinkServiceConnections[0].groupIds[0],Status:privateLinkServiceConnections[0].privateLinkServiceConnectionState.status,Subnet:subnet.id}" \
+  -o table
+
+6. Relevant Private DNS Zones
+
+az network private-dns zone list \
+  --query "[?name=='privatelink.vaultcore.azure.net' || name=='privatelink.database.windows.net'].{Zone:name,RG:resourceGroup}" \
+  -o table
+
+⸻
+
+Expected Existing Architecture
+
+The audit should eventually allow the working environment to be documented as:
+
+                       Azure Web App
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+      Managed Identity              VNet Integration
+              │                           │
+              ▼                           ▼
+ Key Vault Secrets User        App Integration Subnet
+              │                           │
+              │                  VNet / DNS configuration
+              │                           │
+              │                 ┌─────────┴─────────┐
+              │                 │                   │
+              ▼                 ▼                   ▼
+          Key Vault        Key Vault PE          SQL PE
+                               │                   │
+                               ▼                   ▼
+                    Private DNS Zone       Private DNS Zone
+                    vaultcore.azure.net    database.windows.net
+                               │                   │
+                               ▼                   ▼
+                         Private IP            Private IP
+                               │                   │
+                               ▼                   ▼
+                         Key Vault            Azure SQL
+
+⸻
+
+Troubleshooting Order
+
+Always investigate in this sequence:
+
+1. Web App VNet Integration
+          ↓
+2. Integration VNet/Subnet
+          ↓
+3. VNet DNS configuration
+          ↓
+4. Private DNS zones / DNS forwarding
+          ↓
+5. Private Endpoint DNS Zone Groups
+          ↓
+6. DNS resolves to private IP
+          ↓
+7. TCP 443 / TCP 1433 connectivity
+          ↓
+8. Web App Managed Identity
+          ↓
+9. Key Vault RBAC
+          ↓
+10. Application-level SQL / Key Vault access
+
+This prevents authentication issues from being confused with network or DNS problems.
+
+⸻
+
+Existing Environment Audit Checklist
+
+* Correct Azure subscription confirmed.
+* Web App VNet Integration identified.
+* Integration VNet identified.
+* Integration subnet identified.
+* Subnet delegation identified.
+* VNet DNS servers identified.
+* App Service DNS overrides checked.
+* Route All configuration checked.
+* Route table checked.
+* NSG identified.
+* Web App Managed Identity identified.
+* Key Vault RBAC mode checked.
+* Web App → Key Vault role assignment checked.
+* Key Vault Private Endpoint identified.
+* SQL Private Endpoint identified.
+* Both PE connections are Approved.
+* Key Vault DNS Zone Group checked.
+* SQL DNS Zone Group checked.
+* privatelink.vaultcore.azure.net located.
+* privatelink.database.windows.net located.
+* DNS A records checked.
+* Private DNS VNet links checked.
+* Key Vault resolves to private IP from Web App.
+* SQL resolves to private IP from Web App.
+* Key Vault TCP 443 succeeds.
+* SQL TCP 1433 succeeds.
+* Application configuration method identified.
+* End-to-end Key Vault access confirmed.
+* End-to-end SQL access confirmed.
+
+Objective
+
+Do not reproduce the new environment based only on assumptions.
+
+First establish a documented as-is architecture of the currently working environment. Once the current networking, DNS, Private Endpoint, identity, and RBAC relationships are known, the same proven pattern can be reproduced for the new environment with environment-specific resource names and IP ranges.
